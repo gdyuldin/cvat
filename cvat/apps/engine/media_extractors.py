@@ -98,6 +98,47 @@ def rotate_within_exif(img: Image):
 
     return img
 
+
+class AvRotator:
+    """Rotate video frames with ffmpeg filters."""
+    def __init__(self, angle) -> None:
+        self.angle = angle
+        self.graph = None
+
+    def link_nodes(self, *nodes):
+        for c, n in zip(nodes, nodes[1:]):
+            c.link_to(n)
+
+    def _init_filters_graph(self, width, height, format):
+        self.graph = av.filter.Graph()
+        nodes = [
+            self.graph.add_buffer(width=width, height=height, format=format)
+        ]
+        if self.angle == 90:
+            nodes.append(
+                self.graph.add("transpose", "clock")
+            )
+        elif self.angle == 180:
+            nodes.extend([
+                self.graph.add("transpose", "clock"),
+                self.graph.add("transpose", "clock"),
+            ])
+        elif self.angle == 270:
+            nodes.append(
+                self.graph.add("transpose", "cclock")
+            )
+        nodes.append(self.graph.add('buffersink'))
+        self.link_nodes(*nodes)
+        self.graph.configure()
+
+    def process(self, frame: av.VideoFrame) -> av.VideoFrame:
+        if self.graph is None:
+            self._init_filters_graph(frame.width, frame.height, frame.format)
+        self.graph.push(frame)
+        frame = self.graph.pull()
+        return frame
+
+
 class IMediaReader(ABC):
     def __init__(self, source_path, step, start, stop, dimension):
         self._source_path = source_path
@@ -404,22 +445,35 @@ class VideoReader(IMediaReader):
         return False
 
     def _decode(self, container):
+        def _cv_rotator(image, angle):
+            """Rotate image using OpenCV"""
+            pts = image.pts
+            image = av.VideoFrame().from_ndarray(
+                rotate_image(
+                    image.to_ndarray(format='bgr24'),
+                    360 - angle
+                ),
+                format ='bgr24'
+            )
+            image.pts = pts
+            return image
+
         frame_num = 0
         for packet in container.demux():
             if packet.stream.type == 'video':
+                angle = int(packet.stream.metadata.get('rotate', 0))
+                if not angle:
+                    # Nothing to do
+                    rotator = lambda x: x
+                if angle in [90, 180, 270]:
+                    # Fast rotate with ffmpeg filters
+                    rotator = AvRotator(angle).process
+                else:
+                    rotator = lambda x: _cv_rotator(x, angle)
                 for image in packet.decode():
                     frame_num += 1
                     if self._has_frame(frame_num - 1):
-                        if packet.stream.metadata.get('rotate'):
-                            old_image = image
-                            image = av.VideoFrame().from_ndarray(
-                                rotate_image(
-                                    image.to_ndarray(format='bgr24'),
-                                    360 - int(container.streams.video[0].metadata.get('rotate'))
-                                ),
-                                format ='bgr24'
-                            )
-                            image.pts = old_image.pts
+                        image = rotator(image)
                         yield (image, self._source_path[0], image.pts)
 
     def __iter__(self):
